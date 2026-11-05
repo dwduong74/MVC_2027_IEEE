@@ -1,0 +1,12 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Binary files - DO NOT perform any line ending normalization
+*.slx binary
+*.slxc binary
+*.mat binary
+*.pt binary
+*.png binary
+*.jpg binary
+*.pdf binary
+*.zip binary
