@@ -6,6 +6,7 @@
 %              Universidad Nacional de Río Cuarto, Argentina
 %              Politecnico di Torino, Italy
 
+bdclose('all');
 clear; close all; clc;
 %
 

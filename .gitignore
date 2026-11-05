@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# MATLAB
+*.asv
+*.slxc
+slprj/
+*.autosave
+
+# OS
+Thumbs.db
+.DS_Store
