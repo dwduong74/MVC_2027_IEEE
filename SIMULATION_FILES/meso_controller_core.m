@@ -1,16 +1,16 @@
 function [delta_f_cmd, T_FR_cmd, Id_FR_cmd, T_FL_cmd, Id_FL_cmd, T_RR_cmd, Id_RR_cmd, T_RL_cmd, Id_RL_cmd] = meso_controller_core(Tall, Sensor)
-% MESO_CONTROLLER_CORE (Phase 2 Advanced Optimization)
+% MESO_CONTROLLER_CORE
 % IEEE-VTS Motor Vehicle Challenge 2027 (MVC2027)
 % Multi-Objective Energy Management & Motion Control Strategy
 %
 % Integrates:
-% 1. Bidirectional Cascade Traction Control (TCS) & Anti-Lock Braking (ABS) (Ueno et al., 2025)
-% 2. Full-Cycle Regenerative Braking with 70.5/29.5 Front/Rear Loss-Minimization (LMC)
-% 3. Smooth DWPT Centering Barrier with Band-Limited DYC (Morimoto, Fujimoto et al.)
+% 1. Cascade Wheel-Velocity Traction Control System (TCS) (Ueno et al., 2025)
+% 2. Optimal 70.5/29.5 Asymmetric Front/Rear Torque Distribution (LMC) (Nguyen et al., 2023)
+% 3. Smooth Band-Limited Lateral & Yaw Dynamics (Morimoto, Fujimoto et al.)
 % 4. Adaptive Torque-Dependent d-Axis Current Field Weakening (Morimoto et al., 1994)
 %
 % Inputs:
-%   Tall   : Total required driving/braking torque command [Nm] (from velocity controller)
+%   Tall   : Total required driving torque command [Nm] (from velocity controller)
 %   Sensor : 12-element vector of vehicle measurements:
 %            [1] gamma   - Yaw rate [rad/s]
 %            [2] ax      - Longitudinal acceleration [m/s^2]
@@ -52,7 +52,7 @@ if isempty(CtlParams)
         CtlParams.Wheel.R = 0.302;
         CtlParams.Motor.Tmax_f = 500; CtlParams.Motor.Tmax_r = 530;
         CtlParams.Steer.Kp_pos = 0.02; CtlParams.Steer.Kp_yaw = 0.2;
-        CtlParams.DYC.Kp_pos = 4000; CtlParams.DYC.Ki_pos = 35;
+        CtlParams.DYC.Kp_pos = 4000; CtlParams.DYC.Ki_pos = 20;
         CtlParams.DYC.Kd_pos = 1000; CtlParams.DYC.Kp_yaw = 5000;
         CtlParams.DYC.Taud_pos = 0.005;
     end
@@ -60,7 +60,7 @@ if isempty(CtlParams)
         CtlParams.TCS = evalin('base', 'TCS');
     catch
         CtlParams.TCS.K_tcs = 800.0;
-        CtlParams.TCS.slip_ratio_allow = 0.07;
+        CtlParams.TCS.slip_ratio_allow = 0.08;
     end
     try
         CtlParams.ESC = evalin('base', 'ESC');
@@ -100,7 +100,7 @@ if CtlParams.strategy == 1
     return;
 end
 
-%% 2. Advanced Multi-Objective MESO Strategy (control_strategy == 2)
+%% 2. Improved Multi-Objective MESO Strategy (control_strategy == 2)
 % Error states (reference Y = 0, Yaw = 0)
 ey = 0 - PosY;
 eyaw = 0 - Yaw;
@@ -126,24 +126,11 @@ if abs(delta_f_cmd) > 0.0524
     delta_f_cmd = sign(delta_f_cmd) * 0.0524;
 end
 
-% --- B. Direct Yaw Moment Control (DYC) with DWPT Precision Centering ---
+% --- B. Direct Yaw Moment Control (DYC) ---
 % Lateral PID + Heading P control (Exact match to official structure)
-Ki_dyc = 35.0;
-if isfield(CtlParams.DYC, 'Ki_pos')
-    Ki_dyc = CtlParams.DYC.Ki_pos;
-end
-Nz_pos = CtlParams.DYC.Kp_pos * ey + Ki_dyc * last_int_ey + CtlParams.DYC.Kd_pos * dde;
+Nz_pos = CtlParams.DYC.Kp_pos * ey + CtlParams.DYC.Ki_pos * last_int_ey + CtlParams.DYC.Kd_pos * dde;
 Nz_yaw = CtlParams.DYC.Kp_yaw * eyaw;
-
-% Smooth Progressive DWPT Barrier: keeps |PosY| <= 0.050m (safely within 0.070m cliff)
-if abs(ey) > 0.035
-    excess_y = abs(ey) - 0.035;
-    Nz_barrier = sign(ey) * 8000.0 * excess_y;
-else
-    Nz_barrier = 0.0;
-end
-
-Nz = Nz_pos + Nz_yaw + Nz_barrier;
+Nz = Nz_pos + Nz_yaw;
 
 % Directional ESC Barrier: limit extreme yaw rate to prevent spinout
 if abs(gamma) > CtlParams.ESC.gamma_limit && (Nz * gamma > 0)
@@ -163,8 +150,8 @@ if abs(delta_T) > delta_T_max
 end
 
 % --- C. Loss-Minimizing Asymmetric Front/Rear Distribution (LMC) ---
-% Front motors: Ra_f = 0.086 Ohm, Psi_f = 0.180 Wb (2.39x more copper-efficient)
-% Rear motors:  Ra_r = 0.143 Ohm, Psi_r = 0.125 Wb
+% Front motors: Ra_f = 0.086 Ohm, Psi_f = 0.180 Wb (High efficiency)
+% Rear motors:  Ra_r = 0.143 Ohm, Psi_r = 0.125 Wb (Lower efficiency)
 % Optimal copper loss ratio: k_front = 0.705, k_rear = 0.295
 k_f = 0.705;
 k_r = 0.295;
@@ -174,16 +161,14 @@ T_FL_base = (k_f / 2.0) * Tall - 0.5 * delta_T;
 T_RR_base = (k_r / 2.0) * Tall + 0.5 * delta_T;
 T_RL_base = (k_r / 2.0) * Tall - 0.5 * delta_T;
 
-% --- D. Bidirectional Traction Control (TCS) & Anti-Lock Braking (ABS) ---
+% --- D. Cascade Wheel-Velocity Traction Control System (TCS) ---
 % Ref: Ueno, Nguyen et al., IEEE/ASME T-Mech 2025
-slip_allow_accel = 0.07; % 7% allowable acceleration slip
-slip_allow_brake = 0.06; % 6% allowable braking slip
-K_tcs = 800.0;           % Proportional clamping gain [Nm/(m/s)]
+slip_allow = 0.08; % 8% optimal slip
+K_tcs = 800.0;     % TCS proportional reduction gain [Nm/(m/s)]
 
 % Allowable wheel linear velocity
 V_base = max(abs(Vx), 0.5);
-delta_V_allow_accel = max(0.12, slip_allow_accel * V_base);
-delta_V_allow_brake = max(0.12, slip_allow_brake * V_base);
+delta_V_allow = max(0.15, slip_allow * V_base);
 
 % Individual wheel linear speeds
 Vw_FR = abs(w_FR) * R;
@@ -191,45 +176,19 @@ Vw_FL = abs(w_FL) * R;
 Vw_RR = abs(w_RR) * R;
 Vw_RL = abs(w_RL) * R;
 
-if Tall >= 0
-    % --- 1. ACCELERATION / TRACTION MODE (Tall >= 0) ---
-    % Excess spin velocities (wheel spinning faster than vehicle)
-    excess_FR = max(0.0, (Vw_FR - Vx) - delta_V_allow_accel);
-    excess_FL = max(0.0, (Vw_FL - Vx) - delta_V_allow_accel);
-    excess_RR = max(0.0, (Vw_RR - Vx) - delta_V_allow_accel);
-    excess_RL = max(0.0, (Vw_RL - Vx) - delta_V_allow_accel);
+% Excess slip velocities
+excess_FR = max(0.0, (Vw_FR - Vx) - delta_V_allow);
+excess_FL = max(0.0, (Vw_FL - Vx) - delta_V_allow);
+excess_RR = max(0.0, (Vw_RR - Vx) - delta_V_allow);
+excess_RL = max(0.0, (Vw_RL - Vx) - delta_V_allow);
 
-    % Subtractive TCS torque reduction
-    T_FR = max(0.0, T_FR_base - K_tcs * excess_FR);
-    T_FL = max(0.0, T_FL_base - K_tcs * excess_FL);
-    T_RR = max(0.0, T_RR_base - K_tcs * excess_RR);
-    T_RL = max(0.0, T_RL_base - K_tcs * excess_RL);
-else
-    % --- 2. DECELERATION / REGENERATIVE BRAKING MODE (Tall < 0) ---
-    % Recover kinetic energy: T_base is negative.
-    % Excess lockup velocities (wheel spinning slower than vehicle by > 6%)
-    excess_FR_lock = max(0.0, (Vx - Vw_FR) - delta_V_allow_brake);
-    excess_FL_lock = max(0.0, (Vx - Vw_FL) - delta_V_allow_brake);
-    excess_RR_lock = max(0.0, (Vx - Vw_RR) - delta_V_allow_brake);
-    excess_RL_lock = max(0.0, (Vx - Vw_RL) - delta_V_allow_brake);
+% Subtractive TCS torque reduction
+T_FR = max(0.0, T_FR_base - K_tcs * excess_FR);
+T_FL = max(0.0, T_FL_base - K_tcs * excess_FL);
+T_RR = max(0.0, T_RR_base - K_tcs * excess_RR);
+T_RL = max(0.0, T_RL_base - K_tcs * excess_RL);
 
-    % Anti-lock relief: if lockup occurs, add positive torque (reduce braking magnitude)
-    T_FR = min(0.0, T_FR_base + K_tcs * excess_FR_lock);
-    T_FL = min(0.0, T_FL_base + K_tcs * excess_FL_lock);
-    T_RR = min(0.0, T_RR_base + K_tcs * excess_RR_lock);
-    T_RL = min(0.0, T_RL_base + K_tcs * excess_RL_lock);
-
-    % Low-speed anti-reversal cutoff (smooth ramp down when stopping)
-    if abs(Vx) < 0.3
-        ramp = max(0.0, abs(Vx) / 0.3);
-        T_FR = T_FR * ramp;
-        T_FL = T_FL * ramp;
-        T_RR = T_RR * ramp;
-        T_RL = T_RL * ramp;
-    end
-end
-
-% Motor physical saturation limits
+% Motor saturation limits
 T_FR_cmd = min(max(T_FR, -CtlParams.Motor.Tmax_f), CtlParams.Motor.Tmax_f);
 T_FL_cmd = min(max(T_FL, -CtlParams.Motor.Tmax_f), CtlParams.Motor.Tmax_f);
 T_RR_cmd = min(max(T_RR, -CtlParams.Motor.Tmax_r), CtlParams.Motor.Tmax_r);
