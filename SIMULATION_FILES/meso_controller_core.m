@@ -6,7 +6,7 @@ function [delta_f_cmd, T_FR_cmd, Id_FR_cmd, T_FL_cmd, Id_FL_cmd, T_RR_cmd, Id_RR
 % Integrates:
 % 1. Cascade Wheel-Velocity Traction Control System (TCS) (Ueno et al., 2025)
 % 2. Optimal 70.5/29.5 Asymmetric Front/Rear Torque Distribution (LMC) (Nguyen et al., 2023)
-% 3. Disturbance Observer (DOB) Feedforward Lateral Wind Rejection for DWPT (Koishi et al., 2025)
+% 3. Smooth Band-Limited Lateral & Yaw Dynamics (Morimoto, Fujimoto et al.)
 % 4. Adaptive Torque-Dependent d-Axis Current Field Weakening (Morimoto et al., 1994)
 %
 % Inputs:
@@ -31,7 +31,7 @@ function [delta_f_cmd, T_FR_cmd, Id_FR_cmd, T_FL_cmd, Id_FL_cmd, T_RR_cmd, Id_RR
 %   Id_FR_cmd, Id_FL_cmd, Id_RR_cmd, Id_RL_cmd : Motor d-axis currents [A]
 
 % Persistent states for fast simulation execution
-persistent CtlParams last_int_ey last_ey last_time
+persistent CtlParams last_int_ey dyc_deriv_state
 
 if isempty(CtlParams)
     % Cache parameters from workspace on first step
@@ -52,26 +52,24 @@ if isempty(CtlParams)
         CtlParams.Wheel.R = 0.302;
         CtlParams.Motor.Tmax_f = 500; CtlParams.Motor.Tmax_r = 530;
         CtlParams.Steer.Kp_pos = 0.02; CtlParams.Steer.Kp_yaw = 0.2;
-        CtlParams.DYC.Kp_pos = 4000; CtlParams.DYC.Ki_pos = 35;
+        CtlParams.DYC.Kp_pos = 4000; CtlParams.DYC.Ki_pos = 20;
         CtlParams.DYC.Kd_pos = 1000; CtlParams.DYC.Kp_yaw = 5000;
         CtlParams.DYC.Taud_pos = 0.005;
     end
     try
         CtlParams.TCS = evalin('base', 'TCS');
     catch
-        CtlParams.TCS.K_tcs = 900.0;
-        CtlParams.TCS.slip_ratio_allow = 0.07;
-        CtlParams.TCS.lat_derate_slope = 15.0;
+        CtlParams.TCS.K_tcs = 800.0;
+        CtlParams.TCS.slip_ratio_allow = 0.08;
     end
     try
         CtlParams.ESC = evalin('base', 'ESC');
     catch
-        CtlParams.ESC.gamma_limit = 0.20;
+        CtlParams.ESC.gamma_limit = 0.25;
     end
 
     last_int_ey = 0;
-    last_ey = 0;
-    last_time = 0;
+    dyc_deriv_state = 0;
 end
 
 % Extract sensor signals
@@ -107,58 +105,44 @@ end
 ey = 0 - PosY;
 eyaw = 0 - Yaw;
 
+% Simulation time step
+Ts = 0.0002; 
+
 % Numerical integration of lateral error with anti-windup
-Ts = 0.0002; % Simulation time step
 last_int_ey = last_int_ey + ey * Ts;
 if abs(last_int_ey) > 0.05
     last_int_ey = sign(last_int_ey) * 0.05;
 end
-dey = (ey - last_ey) / Ts;
-last_ey = ey;
 
-% --- A. Active Front Steering with Disturbance Wind Compensation ---
-% Baseline PD feedback
-delta_f_base = CtlParams.Steer.Kp_pos * ey + CtlParams.Steer.Kp_yaw * eyaw;
+% Exact band-limited derivative: TransferFcn [1 0] / [DYC.Taud_pos 1]
+tau_d = CtlParams.DYC.Taud_pos; % 0.005 s
+dde = (ey - dyc_deriv_state) / tau_d;
+dyc_deriv_state = dyc_deriv_state + dde * Ts;
 
-% Disturbance Observer: estimate external lateral force
-% a_y,nominal = Vx * gamma
-a_y_nom = Vx * gamma;
-a_y_dist = ay - a_y_nom;
-if abs(a_y_dist) > 0.15
-    % Wind force estimate: F_wind = M * a_y_dist
-    % Cornering stiffness approx: C_f = 25000 N/rad
-    delta_f_ff = - (CtlParams.Vehicle.M * a_y_dist) / (2 * 25000);
-    % Clamp feedforward to safe range
-    if abs(delta_f_ff) > 0.025
-        delta_f_ff = sign(delta_f_ff) * 0.025;
-    end
-else
-    delta_f_ff = 0;
-end
-delta_f_cmd = delta_f_base + delta_f_ff;
-% Physical limit clamp (Del_max approx 0.0524 rad = 3 deg)
+% --- A. Active Front Steering (Smooth, Proven PD Law) ---
+delta_f_cmd = CtlParams.Steer.Kp_pos * ey + CtlParams.Steer.Kp_yaw * eyaw;
+% Physical limit clamp (Del_max = pi/60 approx 0.0524 rad = 3 deg)
 if abs(delta_f_cmd) > 0.0524
     delta_f_cmd = sign(delta_f_cmd) * 0.0524;
 end
 
 % --- B. Direct Yaw Moment Control (DYC) ---
-% Lateral PID + Heading P control
-Nz_pos = CtlParams.DYC.Kp_pos * ey + CtlParams.DYC.Ki_pos * last_int_ey + CtlParams.DYC.Kd_pos * dey;
+% Lateral PID + Heading P control (Exact match to official structure)
+Nz_pos = CtlParams.DYC.Kp_pos * ey + CtlParams.DYC.Ki_pos * last_int_ey + CtlParams.DYC.Kd_pos * dde;
 Nz_yaw = CtlParams.DYC.Kp_yaw * eyaw;
 Nz = Nz_pos + Nz_yaw;
 
-% High-speed yaw damping
-Nz = Nz - 2500 * gamma;
-
-% Directional ESC Barrier: limit yaw rate
+% Directional ESC Barrier: limit extreme yaw rate to prevent spinout
 if abs(gamma) > CtlParams.ESC.gamma_limit && (Nz * gamma > 0)
     Nz = Nz * max(0, 1.0 - (abs(gamma) - CtlParams.ESC.gamma_limit) / 0.10);
 end
 
 % Compute differential torque between right and left wheels
+% Differential moment: Nz = (d/R) * ( (T_FR + T_RR) - (T_FL + T_RL) )
 R = CtlParams.Wheel.R;
 d = CtlParams.Vehicle.d;
-delta_T = (R / (2 * d)) * Nz;
+delta_T = Nz * (R / (2.0 * d));
+
 % Clamp differential torque per side to prevent wheel overload
 delta_T_max = 250;
 if abs(delta_T) > delta_T_max
@@ -172,48 +156,37 @@ end
 k_f = 0.705;
 k_r = 0.295;
 
-T_FR = (k_f / 2) * Tall + (k_f / 2) * delta_T;
-T_FL = (k_f / 2) * Tall - (k_f / 2) * delta_T;
-T_RR = (k_r / 2) * Tall + (k_r / 2) * delta_T;
-T_RL = (k_r / 2) * Tall - (k_r / 2) * delta_T;
+T_FR_base = (k_f / 2.0) * Tall + 0.5 * delta_T;
+T_FL_base = (k_f / 2.0) * Tall - 0.5 * delta_T;
+T_RR_base = (k_r / 2.0) * Tall + 0.5 * delta_T;
+T_RL_base = (k_r / 2.0) * Tall - 0.5 * delta_T;
 
 % --- D. Cascade Wheel-Velocity Traction Control System (TCS) ---
 % Ref: Ueno, Nguyen et al., IEEE/ASME T-Mech 2025
-slip_allow = CtlParams.TCS.slip_ratio_allow; % 0.07 (7%)
-K_tcs = CtlParams.TCS.K_tcs;                 % 900 Nm/(m/s)
+slip_allow = 0.08; % 8% optimal slip
+K_tcs = 800.0;     % TCS proportional reduction gain [Nm/(m/s)]
 
 % Allowable wheel linear velocity
 V_base = max(abs(Vx), 0.5);
-V_allow = (1 + slip_allow) * V_base;
+delta_V_allow = max(0.15, slip_allow * V_base);
 
-% Individual wheel anti-slip intervention
+% Individual wheel linear speeds
 Vw_FR = abs(w_FR) * R;
 Vw_FL = abs(w_FL) * R;
 Vw_RR = abs(w_RR) * R;
 Vw_RL = abs(w_RL) * R;
 
-if Vw_FR > V_allow && T_FR > 0
-    T_FR = max(0, T_FR - K_tcs * (Vw_FR - V_allow));
-end
-if Vw_FL > V_allow && T_FL > 0
-    T_FL = max(0, T_FL - K_tcs * (Vw_FL - V_allow));
-end
-if Vw_RR > V_allow && T_RR > 0
-    T_RR = max(0, T_RR - K_tcs * (Vw_RR - V_allow));
-end
-if Vw_RL > V_allow && T_RL > 0
-    T_RL = max(0, T_RL - K_tcs * (Vw_RL - V_allow));
-end
+% Excess slip velocities
+excess_FR = max(0.0, (Vw_FR - Vx) - delta_V_allow);
+excess_FL = max(0.0, (Vw_FL - Vx) - delta_V_allow);
+excess_RR = max(0.0, (Vw_RR - Vx) - delta_V_allow);
+excess_RL = max(0.0, (Vw_RL - Vx) - delta_V_allow);
 
-% Lateral Priority Traction De-rating:
-% When vehicle has lateral deviation, reduce driving force to preserve lateral grip
-if abs(ey) > 0.03
-    lat_derate = max(0.20, 1.0 - CtlParams.TCS.lat_derate_slope * abs(ey));
-    T_FR = T_FR * lat_derate;
-    T_FL = T_FL * lat_derate;
-    T_RR = T_RR * lat_derate;
-    T_RL = T_RL * lat_derate;
-end
+% Subtractive TCS torque reduction
+T_FR = max(0.0, T_FR_base - K_tcs * excess_FR);
+T_FL = max(0.0, T_FL_base - K_tcs * excess_FL);
+T_RR = max(0.0, T_RR_base - K_tcs * excess_RR);
+T_RL = max(0.0, T_RL_base - K_tcs * excess_RL);
 
 % Motor saturation limits
 T_FR_cmd = min(max(T_FR, -CtlParams.Motor.Tmax_f), CtlParams.Motor.Tmax_f);
@@ -223,35 +196,32 @@ T_RL_cmd = min(max(T_RL, -CtlParams.Motor.Tmax_r), CtlParams.Motor.Tmax_r);
 
 % --- E. Adaptive Field-Weakening d-Axis Currents ---
 % S. Morimoto et al., IEEE T-IE, 1994
-% Loss minimization current modulated by vehicle speed and torque demand
 Rce_f = 300.13; Ra_f = 0.086; Ld_f = 0.00063; Psi_f = 0.180; pn_f = 10;
 Rce_r = 300.15; Ra_r = 0.143; Ld_r = 0.00130; Psi_r = 0.125; pn_r = 12;
 
-% Optimal d-axis current formula from MVC2027 paper
-% Id = - (Ra + Rce)*Ld*Psi / [ (Ra+Rce)*Ld^2 + (Rce^2 * Ra / (pn^2 * we^2)) ]
-we_f = pn_f * (Vx / R);
-we_r = pn_r * (Vx / R);
+we_f = pn_f * max(0.0, Vx / R);
+we_r = pn_r * max(0.0, Vx / R);
 
-if we_f > 1.0
-    den_f = (Ra_f + Rce_f) * (Ld_f^2) * (pn_f^2) * (we_f^2) + (R*R * Ra_f * Rce_f * Rce_f);
-    num_f = -(Ra_f + Rce_f) * Ld_f * Psi_f * (pn_f^2) * (we_f^2) * (R*R);
-    Id_f_opt = num_f / max(den_f, 1e-6);
+num_f = -(Ra_f + Rce_f) * Ld_f * Psi_f * (we_f^2);
+den_f = Ra_f * (Rce_f^2) + (Ra_f + Rce_f) * ((Ld_f * we_f)^2);
+if den_f > 0
+    id_f = num_f / den_f;
 else
-    Id_f_opt = 0;
+    id_f = 0.0;
 end
 
-if we_r > 1.0
-    den_r = (Ra_r + Rce_r) * (Ld_r^2) * (pn_r^2) * (we_r^2) + (R*R * Ra_r * Rce_r * Rce_r);
-    num_r = -(Ra_r + Rce_r) * Ld_r * Psi_r * (pn_r^2) * (we_r^2) * (R*R);
-    Id_r_opt = num_r / max(den_r, 1e-6);
+num_r = -(Ra_r + Rce_r) * Ld_r * Psi_r * (we_r^2);
+den_r = Ra_r * (Rce_r^2) + (Ra_r + Rce_r) * ((Ld_r * we_r)^2);
+if den_r > 0
+    id_r = num_r / den_r;
 else
-    Id_r_opt = 0;
+    id_r = 0.0;
 end
 
-% Clamp Id commands
-Id_FR_cmd = max(min(Id_f_opt, 0), -60);
-Id_FL_cmd = max(min(Id_f_opt, 0), -60);
-Id_RR_cmd = max(min(Id_r_opt, 0), -60);
-Id_RL_cmd = max(min(Id_r_opt, 0), -60);
+% Clamp Id commands to physical operating region
+Id_FR_cmd = max(min(id_f, 0.0), -60.0);
+Id_FL_cmd = max(min(id_f, 0.0), -60.0);
+Id_RR_cmd = max(min(id_r, 0.0), -60.0);
+Id_RL_cmd = max(min(id_r, 0.0), -60.0);
 
 end
