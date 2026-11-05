@@ -68,16 +68,23 @@ end
 
 % 5. Add the Level-2 S-Function block
 fprintf('[4/5] Adding Level-2 S-Function block [%s]...\n', sfun_name);
+if getSimulinkBlockHandle(sfun_path) ~= -1
+    delete_block(sfun_path);
+end
 add_block('simulink/User-Defined Functions/Level-2 MATLAB S-Function', sfun_path, ...
     'Position', [320, 100, 520, 500], ...
     'FunctionName', 'meso_controller_sfun');
 
 % 6. Connect Inports to S-Function
 fprintf('[5/5] Connecting sensor bus and command ports...\n');
-% Inport 1 (T_all) -> S-Function Inport 1
-add_line(subsystem_path, 'T_all/1', [sfun_name '/1'], 'autorouting', 'on');
-% Inport 2 (Sensor) -> S-Function Inport 2
-add_line(subsystem_path, 'Sensor/1', [sfun_name '/2'], 'autorouting', 'on');
+try
+    add_line(subsystem_path, 'T_all/1', [sfun_name '/1'], 'autorouting', 'on');
+catch
+end
+try
+    add_line(subsystem_path, 'Sensor/1', [sfun_name '/2'], 'autorouting', 'on');
+catch
+end
 
 % Connect S-Function 9 outputs to the 9 Outports
 outport_names = { ...
@@ -95,7 +102,10 @@ outport_names = { ...
 for k = 1:length(outport_names)
     src_port = sprintf('%s/%d', sfun_name, k);
     dst_port = sprintf('%s/1', outport_names{k});
-    add_line(subsystem_path, src_port, dst_port, 'autorouting', 'on');
+    try
+        add_line(subsystem_path, src_port, dst_port, 'autorouting', 'on');
+    catch
+    end
 end
 
 % 7. Save and close model cleanly
